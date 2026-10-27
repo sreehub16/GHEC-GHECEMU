@@ -1,0 +1,2 @@
+source_org,source_repo,repo_url,repo_size_MB,target_org,target_repo,target_repo_visibility
+kcghorgz,test_repo-oct.14-20261020-1a,https://github.com/kcghorgz/test_repo-oct.14-20261020-1a,0.12,gl-mig-org,test_repo_oct26,private

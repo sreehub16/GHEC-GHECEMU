@@ -1,0 +1,825 @@
+name: ghec-to-ghec-org-migration-framework
+
+on:
+  workflow_dispatch:
+    inputs:
+      migration_scenario:
+        description: "Select GHEC to GHEC organization migration scenario"
+        required: true
+        type: choice
+        options:
+          - "Non-EMU GHEC -> EMU GHEC-DR"
+          - "Non-EMU GHEC -> EMU GHEC"
+          - "EMU GHEC -> EMU GHEC-DR"
+
+      source_org:
+        description: "Source GHEC organization"
+        required: true
+        type: string
+
+      target_org:
+        description: "New target GHEC organization"
+        required: true
+        type: string
+
+      target_enterprise:
+        description: "Target GHEC enterprise slug"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_PAT: ${{ secrets.SOURCE_PAT }}
+  TARGET_PAT: ${{ secrets.TARGET_PAT }}
+  CONFIGURED_TARGET_API_URL: ${{ secrets.TARGET_API_URL }}
+
+concurrency:
+  group: org-migration-${{ inputs.target_org }}
+  cancel-in-progress: false
+
+jobs:
+  pre-migration-validation:
+    name: Stage 1 - Organization migration validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      target_api_url: ${{ steps.resolve.outputs.target_api_url }}
+      target_host: ${{ steps.resolve.outputs.target_host }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gh jq curl
+
+      - name: Resolve migration configuration
+        id: resolve
+        shell: bash
+        env:
+          SCENARIO: ${{ inputs.migration_scenario }}
+        run: |
+          set -euo pipefail
+
+          case "$SCENARIO" in
+            "Non-EMU GHEC -> EMU GHEC")
+              TARGET_API_URL="https://api.github.com"
+              TARGET_HOST="github.com"
+              ;;
+
+            "Non-EMU GHEC -> EMU GHEC-DR"|"EMU GHEC -> EMU GHEC-DR")
+              if [[ -z "${CONFIGURED_TARGET_API_URL:-}" ]]; then
+                echo "::error::TARGET_API_URL secret must be configured for a GHEC-DR target."
+                exit 1
+              fi
+
+              TARGET_API_URL="${CONFIGURED_TARGET_API_URL%/}"
+
+              if [[ "$TARGET_API_URL" == "https://api.github.com" ]]; then
+                echo "::error::Selected scenario requires a GHEC-DR target API URL."
+                exit 1
+              fi
+
+              if [[ ! "$TARGET_API_URL" =~ ^https://api\.[A-Za-z0-9.-]+\.ghe\.com$ ]]; then
+                echo "::error::TARGET_API_URL must be a GHEC-DR API URL such as https://api.example.ghe.com."
+                exit 1
+              fi
+
+              TARGET_HOST="${TARGET_API_URL#https://api.}"
+              TARGET_HOST="${TARGET_HOST%%/*}"
+              ;;
+
+            *)
+              echo "::error::Unsupported migration scenario: $SCENARIO"
+              exit 1
+              ;;
+          esac
+
+          echo "target_api_url=$TARGET_API_URL" >> "$GITHUB_OUTPUT"
+          echo "target_host=$TARGET_HOST" >> "$GITHUB_OUTPUT"
+
+          echo "[INFO] Migration scenario: $SCENARIO"
+          echo "[INFO] Effective target API: $TARGET_API_URL"
+
+      - name: Validate organization migration inputs
+        shell: bash
+        env:
+          SOURCE_ORG: ${{ inputs.source_org }}
+          TARGET_ORG: ${{ inputs.target_org }}
+          TARGET_ENTERPRISE: ${{ inputs.target_enterprise }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$SOURCE_ORG" ]] || { echo "::error::source_org is required."; exit 1; }
+          [[ -n "$TARGET_ORG" ]] || { echo "::error::target_org is required."; exit 1; }
+          [[ -n "$TARGET_ENTERPRISE" ]] || { echo "::error::target_enterprise is required."; exit 1; }
+
+
+          [[ -n "${SOURCE_PAT:-}" ]] || { echo "::error::SOURCE_PAT secret is required."; exit 1; }
+          [[ -n "${TARGET_PAT:-}" ]] || { echo "::error::TARGET_PAT secret is required."; exit 1; }
+
+          echo "[INFO] Organization migration inputs validated."
+
+      - name: Validate source and target PATs
+        shell: bash
+        env:
+          TARGET_API_URL: ${{ steps.resolve.outputs.target_api_url }}
+        run: |
+          set -euo pipefail
+
+          echo "[INFO] Validating SOURCE_PAT against https://api.github.com..."
+
+          SOURCE_HTTP=$(curl -sS \
+            -o /tmp/source-user.json \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${SOURCE_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user")
+
+          if [[ "$SOURCE_HTTP" != "200" ]]; then
+            echo "::error::SOURCE_PAT authentication failed. HTTP status: $SOURCE_HTTP"
+            jq -r '.message // "Unknown API error"' /tmp/source-user.json || true
+            exit 1
+          fi
+
+          SOURCE_USER=$(jq -r '.login // "unknown"' /tmp/source-user.json)
+          echo "[INFO] SOURCE_PAT authentication successful for ${SOURCE_USER}."
+
+          echo "[INFO] Validating TARGET_PAT against ${TARGET_API_URL}..."
+
+          TARGET_HTTP=$(curl -sS \
+            -o /tmp/target-user.json \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${TARGET_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${TARGET_API_URL}/user")
+
+          if [[ "$TARGET_HTTP" != "200" ]]; then
+            echo "::error::TARGET_PAT authentication failed. HTTP status: $TARGET_HTTP"
+            jq -r '.message // "Unknown API error"' /tmp/target-user.json || true
+            exit 1
+          fi
+
+          TARGET_USER=$(jq -r '.login // "unknown"' /tmp/target-user.json)
+          echo "[INFO] TARGET_PAT authentication successful for ${TARGET_USER}."
+
+          {
+            echo "## Organization Migration - Pre-validation"
+            echo
+            echo "| Parameter | Value |"
+            echo "|---|---|"
+            echo "| Scenario | \`${{ inputs.migration_scenario }}\` |"
+            echo "| Source Organization | \`${{ inputs.source_org }}\` |"
+            echo "| Target Organization | \`${{ inputs.target_org }}\` |"
+            echo "| Target Enterprise | \`${{ inputs.target_enterprise }}\` |"
+            echo "| Target API | \`${TARGET_API_URL}\` |"
+            echo "| Source PAT | Valid - \`${SOURCE_USER}\` |"
+            echo "| Target PAT | Valid - \`${TARGET_USER}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate source organization access
+        shell: bash
+        env:
+          SOURCE_ORG: ${{ inputs.source_org }}
+        run: |
+          set -euo pipefail
+
+          STATUS=$(curl -sS \
+            -o /tmp/source-org.json \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${SOURCE_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/${SOURCE_ORG}")
+
+          if [[ "$STATUS" != "200" ]]; then
+            echo "::error::Source organization '${SOURCE_ORG}' is not accessible with SOURCE_PAT. HTTP status: $STATUS"
+            jq -r '.message // "Unknown API error"' /tmp/source-org.json || true
+            exit 1
+          fi
+
+          echo "[INFO] Source organization '${SOURCE_ORG}' is accessible."
+
+      - name: Verify target organization is unused
+        shell: bash
+        env:
+          TARGET_ORG: ${{ inputs.target_org }}
+          TARGET_API_URL: ${{ steps.resolve.outputs.target_api_url }}
+        run: |
+          set -euo pipefail
+
+          STATUS=$(curl -sS \
+            -o /tmp/target-org.json \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${TARGET_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${TARGET_API_URL}/orgs/${TARGET_ORG}")
+
+          case "$STATUS" in
+            404)
+              echo "[INFO] Target organization name is available: ${TARGET_ORG}"
+              ;;
+            200)
+              echo "::error::Target organization '${TARGET_ORG}' already exists."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unable to validate target organization '${TARGET_ORG}'. HTTP status: $STATUS"
+              jq -r '.message // "Unknown API error"' /tmp/target-org.json || true
+              exit 1
+              ;;
+          esac
+
+      - name: Install GEI extension and authenticate target
+        shell: bash
+        env:
+          TARGET_API_URL: ${{ steps.resolve.outputs.target_api_url }}
+          TARGET_HOST: ${{ steps.resolve.outputs.target_host }}
+        run: |
+          set -euo pipefail
+
+          echo "[INFO] Installing GEI extension for all migration scenarios..."
+
+          # Install GEI locally on the runner from its GitHub.com repository.
+          # This is identical for standard GHEC and GHEC-DR targets.
+          gh extension install https://github.com/github/gh-gei --force
+
+          gh gei --help >/dev/null
+          echo "[INFO] GEI extension installed successfully."
+
+          echo "[INFO] Authenticating to migration target..."
+
+          if [[ "$TARGET_API_URL" == "https://api.github.com" ]]; then
+            printf '%s' "$TARGET_PAT" | gh auth login --with-token
+            gh auth status
+          else
+            printf '%s' "$TARGET_PAT" | gh auth login \
+              --hostname "$TARGET_HOST" \
+              --with-token
+            gh auth status --hostname "$TARGET_HOST"
+          fi
+
+          echo "[INFO] GEI is ready for target: $TARGET_HOST"
+
+  organization-migration:
+    name: Stage 2 - Organization migration
+    environment: migration-approval
+    needs: [pre-migration-validation]
+    if: ${{ needs.pre-migration-validation.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+
+    env:
+      MIGRATION_SCENARIO: ${{ inputs.migration_scenario }}
+      TARGET_HOST: ${{ needs.pre-migration-validation.outputs.target_host }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gh jq curl
+
+      - name: Resolve Stage 2 target configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$MIGRATION_SCENARIO" in
+            "Non-EMU GHEC -> EMU GHEC")
+              TARGET_API_URL="https://api.github.com"
+              TARGET_HOST="github.com"
+              ;;
+
+            "Non-EMU GHEC -> EMU GHEC-DR"|"EMU GHEC -> EMU GHEC-DR")
+              if [[ -z "${TARGET_HOST:-}" ]]; then
+                echo "::error::TARGET_HOST is empty for GHEC-DR migration."
+                exit 1
+              fi
+
+              TARGET_API_URL="https://api.${TARGET_HOST}"
+
+              if [[ ! "$TARGET_API_URL" =~ ^https://api\.[A-Za-z0-9.-]+\.ghe\.com$ ]]; then
+                echo "::error::Invalid GHEC-DR target API URL: $TARGET_API_URL"
+                exit 1
+              fi
+              ;;
+
+            *)
+              echo "::error::Unsupported migration scenario in Stage 2: $MIGRATION_SCENARIO"
+              exit 1
+              ;;
+          esac
+
+          echo "TARGET_API_URL=$TARGET_API_URL" >> "$GITHUB_ENV"
+          echo "TARGET_HOST=$TARGET_HOST" >> "$GITHUB_ENV"
+
+          echo "[INFO] Stage 2 migration scenario: $MIGRATION_SCENARIO"
+          echo "[INFO] Stage 2 target host: $TARGET_HOST"
+          echo "[INFO] Stage 2 target API: $TARGET_API_URL"
+
+      - name: Install GEI extension and authenticate target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "[INFO] Installing GEI extension for all migration scenarios..."
+
+          # Stage 2 runs on a fresh runner, so install GEI again.
+          # Install locally from GitHub.com for both standard GHEC and GHEC-DR.
+          gh extension install https://github.com/github/gh-gei --force
+
+          gh gei --help >/dev/null
+          echo "[INFO] GEI extension installed successfully."
+
+          echo "[INFO] Authenticating to migration target..."
+
+          if [[ "$TARGET_API_URL" == "https://api.github.com" ]]; then
+            printf '%s' "$TARGET_PAT" | gh auth login --with-token
+            gh auth status
+          else
+            printf '%s' "$TARGET_PAT" | gh auth login \
+              --hostname "$TARGET_HOST" \
+              --with-token
+            gh auth status --hostname "$TARGET_HOST"
+          fi
+
+          echo "[INFO] GEI is ready for target: $TARGET_HOST"
+
+      - name: Run organization migration
+        id: org_migration
+        shell: bash
+        env:
+          SOURCE_ORG: ${{ inputs.source_org }}
+          TARGET_ORG: ${{ inputs.target_org }}
+          TARGET_ENTERPRISE: ${{ inputs.target_enterprise }}
+        run: |
+          set -uo pipefail
+
+          export GH_PAT="${TARGET_PAT}"
+
+          # Never allow GEI to run with a missing or inconsistent target API.
+          if [[ -z "${TARGET_API_URL:-}" ]]; then
+            echo "::error::TARGET_API_URL is empty in Stage 2."
+            exit 1
+          fi
+
+          case "$MIGRATION_SCENARIO" in
+            "Non-EMU GHEC -> EMU GHEC")
+              if [[ "$TARGET_API_URL" != "https://api.github.com" ]]; then
+                echo "::error::Standard GHEC scenario resolved unexpected target API: $TARGET_API_URL"
+                exit 1
+              fi
+              ;;
+
+            "Non-EMU GHEC -> EMU GHEC-DR"|"EMU GHEC -> EMU GHEC-DR")
+              if [[ "$TARGET_API_URL" == "https://api.github.com" ]]; then
+                echo "::error::GHEC-DR scenario cannot use https://api.github.com."
+                exit 1
+              fi
+
+              if [[ ! "$TARGET_API_URL" =~ ^https://api\.[A-Za-z0-9.-]+\.ghe\.com$ ]]; then
+                echo "::error::Invalid GHEC-DR target API URL: $TARGET_API_URL"
+                exit 1
+              fi
+              ;;
+
+            *)
+              echo "::error::Unsupported migration scenario in Stage 2: $MIGRATION_SCENARIO"
+              exit 1
+              ;;
+          esac
+
+          args=(
+            gh gei migrate-org
+            --github-source-org "$SOURCE_ORG"
+            --github-target-org "$TARGET_ORG"
+            --github-target-enterprise "$TARGET_ENTERPRISE"
+          )
+
+          if [[ "$TARGET_API_URL" != "https://api.github.com" ]]; then
+            args+=(--target-api-url "$TARGET_API_URL")
+          fi
+
+          echo "[INFO] Starting organization migration."
+          echo "[INFO] Source organization: $SOURCE_ORG"
+          echo "[INFO] Target organization: $TARGET_ORG"
+          echo "[INFO] Target enterprise: $TARGET_ENTERPRISE"
+          echo "[INFO] Target API: $TARGET_API_URL"
+
+          set +e
+          "${args[@]}" 2>&1 | tee org_migration.log
+          RC=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit_code=$RC" >> "$GITHUB_OUTPUT"
+
+          if [[ "$RC" -ne 0 ]]; then
+            echo "::error::Organization migration failed with exit code $RC."
+            exit "$RC"
+          fi
+
+          echo "[INFO] Organization migration completed successfully."
+
+      - name: Publish migration summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          EXIT_CODE: ${{ steps.org_migration.outputs.exit_code }}
+        run: |
+          {
+            echo "## Organization Migration Result"
+            echo
+            echo "| Parameter | Value |"
+            echo "|---|---|"
+            echo "| Scenario | \`${{ inputs.migration_scenario }}\` |"
+            echo "| Source Organization | \`${{ inputs.source_org }}\` |"
+            echo "| Target Organization | \`${{ inputs.target_org }}\` |"
+            echo "| Target Enterprise | \`${{ inputs.target_enterprise }}\` |"
+            echo "| Target API | \`${TARGET_API_URL}\` |"
+            echo "| Exit Code | \`${EXIT_CODE:-not-available}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Capture migration artifacts
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          mkdir -p org-migration-logs
+          cp -v org_migration.log org-migration-logs/ 2>/dev/null || true
+          cp -v ./*.octoshift*.log org-migration-logs/ 2>/dev/null || true
+
+      - name: Upload migration artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghec-to-ghec-org-migration-${{ github.run_id }}
+          path: org-migration-logs/
+          if-no-files-found: warn
+
+  post-migration-validation:
+    name: Stage 3 - Post-migration validation
+    needs: [pre-migration-validation, organization-migration]
+    if: ${{ always() && needs.organization-migration.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      MIGRATION_SCENARIO: ${{ inputs.migration_scenario }}
+      TARGET_HOST: ${{ needs.pre-migration-validation.outputs.target_host }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y python3 curl jq
+
+      - name: Resolve Stage 3 target configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$MIGRATION_SCENARIO" in
+            "Non-EMU GHEC -> EMU GHEC")
+              TARGET_API_URL="https://api.github.com"
+              TARGET_HOST="github.com"
+              ;;
+
+            "Non-EMU GHEC -> EMU GHEC-DR"|"EMU GHEC -> EMU GHEC-DR")
+              if [[ -z "${TARGET_HOST:-}" ]]; then
+                echo "::error::TARGET_HOST is empty for GHEC-DR post-migration validation."
+                exit 1
+              fi
+
+              TARGET_API_URL="https://api.${TARGET_HOST}"
+
+              if [[ ! "$TARGET_API_URL" =~ ^https://api\.[A-Za-z0-9.-]+\.ghe\.com$ ]]; then
+                echo "::error::Invalid GHEC-DR target API URL: $TARGET_API_URL"
+                exit 1
+              fi
+              ;;
+
+            *)
+              echo "::error::Unsupported migration scenario in Stage 3: $MIGRATION_SCENARIO"
+              exit 1
+              ;;
+          esac
+
+          echo "TARGET_API_URL=$TARGET_API_URL" >> "$GITHUB_ENV"
+          echo "TARGET_HOST=$TARGET_HOST" >> "$GITHUB_ENV"
+          echo "[INFO] Stage 3 target API: $TARGET_API_URL"
+
+      - name: High-level organization validation
+        shell: bash
+        env:
+          SOURCE_ORG: ${{ inputs.source_org }}
+          TARGET_ORG: ${{ inputs.target_org }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          SOURCE_API = "https://api.github.com"
+          TARGET_API = os.environ["TARGET_API_URL"].rstrip("/")
+          SOURCE_ORG = os.environ["SOURCE_ORG"]
+          TARGET_ORG = os.environ["TARGET_ORG"]
+          SOURCE_PAT = os.environ["SOURCE_PAT"]
+          TARGET_PAT = os.environ["TARGET_PAT"]
+          MIGRATION_SCENARIO = os.environ["MIGRATION_SCENARIO"]
+
+          headers_common = {
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "ghec-org-migration-post-validation",
+          }
+
+          def request_json(base, token, path):
+              url = f"{base}{path}"
+              headers = dict(headers_common)
+              headers["Authorization"] = f"Bearer {token}"
+              req = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      body = r.read()
+                      return r.status, json.loads(body.decode("utf-8")) if body else None
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(f"GET {url} failed: HTTP {e.code}: {body}") from e
+
+          def paginated(base, token, path):
+              result = []
+              page = 1
+              sep = "&" if "?" in path else "?"
+              while True:
+                  status, data = request_json(
+                      base, token, f"{path}{sep}per_page=100&page={page}"
+                  )
+                  if status != 200 or not isinstance(data, list):
+                      raise RuntimeError(f"Unexpected paginated response for {path}")
+                  result.extend(data)
+                  if len(data) < 100:
+                      break
+                  page += 1
+              return result
+
+          def save_json(name, value):
+              with open(name, "w", encoding="utf-8") as f:
+                  json.dump(value, f, indent=2)
+
+          def visibility_counts(repo_map):
+              counts = {"private": 0, "internal": 0, "public": 0}
+              for repo in repo_map.values():
+                  visibility = repo.get("visibility")
+                  if visibility in counts:
+                      counts[visibility] += 1
+              return counts
+
+          failures = []
+
+          # High-level organization accessibility: one API call per side.
+          _, source_org = request_json(
+              SOURCE_API, SOURCE_PAT,
+              f"/orgs/{urllib.parse.quote(SOURCE_ORG, safe='')}"
+          )
+          _, target_org = request_json(
+              TARGET_API, TARGET_PAT,
+              f"/orgs/{urllib.parse.quote(TARGET_ORG, safe='')}"
+          )
+          save_json("source-org.json", source_org)
+          save_json("target-org.json", target_org)
+
+          # Repository inventory only. This is paginated at 100 repositories per page
+          # and intentionally avoids per-repository, branch, member, team, or variable calls.
+          source_repos = paginated(
+              SOURCE_API, SOURCE_PAT,
+              f"/orgs/{urllib.parse.quote(SOURCE_ORG, safe='')}/repos?type=all"
+          )
+          target_repos = paginated(
+              TARGET_API, TARGET_PAT,
+              f"/orgs/{urllib.parse.quote(TARGET_ORG, safe='')}/repos?type=all"
+          )
+          save_json("source-repositories.json", source_repos)
+          save_json("target-repositories.json", target_repos)
+
+          # GEI-created repositories are excluded internally from parity validation.
+          # They are intentionally not shown in the customer-facing summary.
+          GEI_SYSTEM_REPOSITORIES = {"gei-migration-results"}
+
+          src_repo = {x["name"]: x for x in source_repos if x.get("name")}
+          tgt_repo = {
+              x["name"]: x
+              for x in target_repos
+              if x.get("name") and x["name"] not in GEI_SYSTEM_REPOSITORIES
+          }
+
+          src_names = set(src_repo)
+          tgt_names = set(tgt_repo)
+          missing_repos = sorted(src_names - tgt_names)
+          unexpected_repos = sorted(tgt_names - src_names)
+
+          source_visibility = visibility_counts(src_repo)
+          target_visibility = visibility_counts(tgt_repo)
+          source_archived = sum(1 for r in src_repo.values() if bool(r.get("archived")))
+          target_archived = sum(1 for r in tgt_repo.values() if bool(r.get("archived")))
+
+          repo_rows = []
+          repo_mismatch_count = 0
+
+          # Compare locally using the inventory already fetched. No per-repository API calls.
+          for name in sorted(src_names | tgt_names):
+              s = src_repo.get(name)
+              t = tgt_repo.get(name)
+
+              if s is None:
+                  repo_rows.append([name, "FAILED", "", "", "", "", "Unexpected on target"])
+                  repo_mismatch_count += 1
+                  continue
+
+              if t is None:
+                  repo_rows.append([
+                      name, "FAILED", s.get("visibility", ""), "",
+                      str(bool(s.get("archived"))), "", "Missing on target"
+                  ])
+                  repo_mismatch_count += 1
+                  continue
+
+              issues = []
+              if s.get("visibility") != t.get("visibility"):
+                  issues.append("visibility")
+              if (s.get("default_branch") or "") != (t.get("default_branch") or ""):
+                  issues.append("default_branch")
+              if bool(s.get("archived")) != bool(t.get("archived")):
+                  issues.append("archived")
+
+              status = "PASSED" if not issues else "FAILED"
+              if issues:
+                  repo_mismatch_count += 1
+
+              repo_rows.append([
+                  name,
+                  status,
+                  s.get("visibility", ""),
+                  t.get("visibility", ""),
+                  str(bool(s.get("archived"))),
+                  str(bool(t.get("archived"))),
+                  ", ".join(issues) if issues else "Matched",
+              ])
+
+          if len(src_repo) != len(tgt_repo):
+              failures.append(
+                  f"Repository count mismatch: source={len(src_repo)}, target={len(tgt_repo)}"
+              )
+          if missing_repos:
+              failures.append(f"Repositories missing on target: {len(missing_repos)}")
+          if unexpected_repos:
+              failures.append(f"Unexpected repositories on target: {len(unexpected_repos)}")
+          if repo_mismatch_count:
+              failures.append(
+                  f"Repositories with metadata/name discrepancies: {repo_mismatch_count}"
+              )
+
+          with open("repository-validation.csv", "w", newline="", encoding="utf-8") as f:
+              w = csv.writer(f)
+              w.writerow([
+                  "repository", "status", "source_visibility", "target_visibility",
+                  "source_archived", "target_archived", "details"
+              ])
+              w.writerows(repo_rows)
+
+          repository_status = (
+              "PASSED"
+              if not missing_repos and not unexpected_repos and repo_mismatch_count == 0
+              else "FAILED"
+          )
+
+          result = {
+              "migration_scenario": MIGRATION_SCENARIO,
+              "source_org": SOURCE_ORG,
+              "target_org": TARGET_ORG,
+              "target_api_url": TARGET_API,
+              "organization_access": {
+                  "source": "PASSED",
+                  "target": "PASSED",
+              },
+              "repositories": {
+                  "source_count": len(src_repo),
+                  "target_count": len(tgt_repo),
+                  "source_visibility": source_visibility,
+                  "target_visibility": target_visibility,
+                  "source_archived_count": source_archived,
+                  "target_archived_count": target_archived,
+                  "missing_on_target": missing_repos,
+                  "unexpected_on_target": unexpected_repos,
+                  "metadata_mismatch_count": repo_mismatch_count,
+                  "status": repository_status,
+              },
+              "hard_failures": failures,
+              "overall_status": "FAILED" if failures else "PASSED",
+          }
+          save_json("org-post-migration-validation.json", result)
+
+          def parity_status(source_value, target_value):
+              return "PASS" if source_value == target_value else "FAIL"
+
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary, "a", encoding="utf-8") as f:
+              f.write("## GHEC Organization Migration - Post-Migration Validation\n\n")
+              f.write("| Migration Information | Value |\n")
+              f.write("|---|---|\n")
+              f.write(f"| **Migration Scenario** | `{MIGRATION_SCENARIO}` |\n")
+              f.write(f"| **Source Organization** | `{SOURCE_ORG}` |\n")
+              f.write(f"| **Target Organization** | `{TARGET_ORG}` |\n")
+
+              f.write("\n### Migration Validation Summary\n\n")
+              f.write("| Validation | Source | Target | Status |\n")
+              f.write("|---|---:|---:|---|\n")
+              f.write("| Organization Accessible | Yes | Yes | **PASS** |\n")
+              f.write(
+                  f"| Repositories | {len(src_repo)} | {len(tgt_repo)} | "
+                  f"**{parity_status(len(src_repo), len(tgt_repo))}** |\n"
+              )
+              f.write(
+                  f"| Private Repositories | {source_visibility['private']} | "
+                  f"{target_visibility['private']} | "
+                  f"**{parity_status(source_visibility['private'], target_visibility['private'])}** |\n"
+              )
+              f.write(
+                  f"| Internal Repositories | {source_visibility['internal']} | "
+                  f"{target_visibility['internal']} | "
+                  f"**{parity_status(source_visibility['internal'], target_visibility['internal'])}** |\n"
+              )
+              f.write(
+                  f"| Public Repositories | {source_visibility['public']} | "
+                  f"{target_visibility['public']} | "
+                  f"**{parity_status(source_visibility['public'], target_visibility['public'])}** |\n"
+              )
+              f.write(
+                  f"| Archived Repositories | {source_archived} | {target_archived} | "
+                  f"**{parity_status(source_archived, target_archived)}** |\n"
+              )
+
+              f.write("\n### Repository Integrity\n\n")
+              f.write("| Validation | Result | Status |\n")
+              f.write("|---|---:|---|\n")
+              f.write(
+                  f"| Missing Repositories | {len(missing_repos)} | "
+                  f"**{'PASS' if not missing_repos else 'FAIL'}** |\n"
+              )
+              f.write(
+                  f"| Unexpected Repositories | {len(unexpected_repos)} | "
+                  f"**{'PASS' if not unexpected_repos else 'FAIL'}** |\n"
+              )
+              f.write(
+                  f"| Repository Metadata Mismatches | {repo_mismatch_count} | "
+                  f"**{'PASS' if repo_mismatch_count == 0 else 'FAIL'}** |\n"
+              )
+              f.write(
+                  f"\n### Overall Migration Validation: **{result['overall_status']}**\n"
+              )
+
+          print(json.dumps(result, indent=2))
+
+          if failures:
+              print("::error::Post-migration validation failed.")
+              sys.exit(1)
+
+          print("[INFO] Post-migration validation passed.")
+          PY
+
+      - name: Upload post-migration validation artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghec-to-ghec-org-post-validation-${{ github.run_id }}
+          path: |
+            source-org.json
+            target-org.json
+            source-repositories.json
+            target-repositories.json
+            repository-validation.csv
+            org-post-migration-validation.json
+          if-no-files-found: warn
